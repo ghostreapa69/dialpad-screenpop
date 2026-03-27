@@ -1,0 +1,68 @@
+version: "3.8"
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: dialpad-screenpop-redis
+    restart: unless-stopped
+    networks:
+      - dialpad-screen-pop
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  dialpad-screenpop:
+    image: ghostreaper69/dialpad-screen-pop:v0.0.16
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      replicas: 2
+      update_config:
+        parallelism: 1
+        delay: 10s
+        order: start-first
+      restart_policy:
+        condition: on-failure
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=traefik
+      - traefik.http.routers.dialpad-screen-pop.rule=Host(`<your_hostname`)
+      - traefik.http.routers.dialpad-screen-pop.entrypoints=websecure
+      - traefik.http.routers.dialpad-screen-pop.tls.certresolver=letsencrypt
+      - traefik.http.services.dialpad-screen-pop.loadbalancer.server.port=3500
+      - traefik.http.services.dialpad-screen-pop.loadbalancer.healthcheck.path=/health
+      - traefik.http.services.dialpad-screen-pop.loadbalancer.healthcheck.interval=10s
+      - traefik.http.services.dialpad-screen-pop.loadbalancer.healthcheck.timeout=3s
+    environment:
+      - PORT=3500
+      - REDIS_URL=redis://redis:6379
+      - DIALPAD_API_KEY=
+      - DIALPAD_WEBHOOK_SECRET=
+      - SALESFORCE_BASE_URL=
+      - FIVE9_SECRET=
+      - SF_LOGIN_URL=
+      - SF_CLIENT_ID=
+      - SF_CLIENT_SECRET=
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3500/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - dialpad-screen-pop
+      - traefik
+
+volumes:
+  redis-data:
+    driver: local
+networks:
+  dialpad-screen-pop:
+    driver: bridge
+  traefik:
+    external: true

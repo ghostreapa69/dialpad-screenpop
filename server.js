@@ -1,0 +1,782 @@
+const express = require('express');
+const jwt = require('jsonwebtoken');
+const axios = require('axios');
+const Redis = require('ioredis');
+const app = express();
+
+// ============================================================
+// CONFIGURATION - Update these values before deploying
+// ============================================================
+const CONFIG = {
+  port: process.env.PORT || 3500,
+
+  // Dialpad API key (must have screen_pop scope)
+  dialpadApiKey: process.env.DIALPAD_API_KEY || 'YOUR_DIALPAD_API_KEY',
+
+  // The secret you used when creating the Dialpad webhook (Step 1)
+  // Leave empty string if you created the webhook without a secret
+  dialpadWebhookSecret: process.env.DIALPAD_WEBHOOK_SECRET || '',
+
+  // Your Salesforce instance URL (e.g., https://yourcompany.lightning.force.com)
+  salesforceBaseUrl: process.env.SALESFORCE_BASE_URL || 'https://yourcompany.lightning.force.com',
+
+  // Shared secret for Five9 connector (optional, for verifying Five9 requests)
+  five9Secret: process.env.FIVE9_SECRET || '',
+
+  // Redis connection URL
+  redisUrl: process.env.REDIS_URL || 'redis://localhost:6379',
+
+  // How long to keep the phone-to-SalesforceID mapping (seconds)
+  // 5 minutes should be plenty for a transfer to complete
+  cacheTtlSec: 5 * 60,
+
+  // Salesforce API credentials (Connected App — client_credentials OAuth flow)
+  sfLoginUrl: process.env.SF_LOGIN_URL || 'https://login.salesforce.com',
+  sfClientId: process.env.SF_CLIENT_ID || '',
+  sfClientSecret: process.env.SF_CLIENT_SECRET || '',
+};
+
+// ============================================================
+// REDIS CLIENT
+// Keys are stored as "screenpop:<phone>" with a 5-minute TTL
+// ============================================================
+const redis = new Redis(CONFIG.redisUrl, {
+  retryStrategy(times) {
+    const delay = Math.min(times * 200, 5000);
+    console.log(`[Redis] Reconnecting in ${delay}ms (attempt ${times})`);
+    return delay;
+  },
+  maxRetriesPerRequest: 3,
+});
+
+redis.on('connect', () => console.log('[Redis] Connected'));
+redis.on('error', (err) => console.error('[Redis] Error:', err.message));
+redis.on('close', () => console.warn('[Redis] Connection closed'));
+
+const REDIS_PREFIX = 'screenpop:';
+
+// ============================================================
+// LEAD -> CONTACT FIELD MAPPING
+// Key = Contact field API name, Value = Lead field API name
+// ============================================================
+const LEAD_TO_CONTACT_MAP = {
+  'FirstName': 'FirstName',
+  'LastName': 'LastName',
+  'Best_Contact_Number__c': 'Best_Contact_Number__c',
+  'Phone': 'Phone',
+  'MobilePhone': 'MobilePhone',
+  'OtherPhone': 'OtherPhone__c',
+  'Email': 'Email',
+  'Dialer_Employment_Status__c': 'Employment_Status__c',
+  'MailingCity': 'Subject_Property_City__c',
+  'MailingPostalCode': 'Subject_Property_Zip_Code__c',
+  'MailingState': 'Subject_Property_State__c',
+  'MailingStreet': 'Subject_Property_Street_Address__c',
+  'Dialer_DOB__c': 'Birthdate__c',
+  'Dialer_SSN__c': 'SSN__c',
+  'SSN__c': 'SSN__c',
+  'Dialer_Borrower_Income__c': 'Borrower_Income__c',
+  'Dialer_Credit_Grade__c': 'FICO_Score__c',
+  'Estimated_Credit_Score__c': 'FICO_Score__c',
+  'Dialer_beginning_Loan_Amount__c': 'Dialer_beginning_Loan_Amount__c',
+  'Dialer_Additional_Cash__c': 'Additional_Cash__c',
+  'Dialer_Cash_Out_Amount__c': 'Cash_Out_Amount__c',
+  'Dialer_Mortgage_Goal__c': 'Mortgage_Goal__c',
+  'Loan_Purpose__c': 'Loan_Purpose__c',
+  'Loan_Amount__c': 'Loan_Amount__c',
+  'Dialer_Desired_Loan_Amount__c': 'Desired_Loan_Amount__c',
+  'Dialer_Rate_Type__c': 'Rate_Type__c',
+  'Dialer_Desired_Rate__c': 'Desired_Rate_Type__c',
+  'Dialer_Revolving_Debt_Balance__c': 'Monthly_Revolving_Debt_Payment__c',
+  'Dialer_Revolving_Debt__c': 'Revolving_Debt__c',
+  'Dialer_Total_Installment_Balance__c': 'Monthly_Installment_Payment__c',
+  'Dialer_Monthly_Installment_Payment__c': 'Total_Installment_Balance__c',
+  // 'AccountId__c': 'Loan_Partner__c',
+  'Telemarketer__c': 'Lead_Generator__c',
+  'Dialer_Year_House_Acquired__c': 'Year_House_Acquired__c',
+  'Dialer_Home_Purchase_Date__c': 'Home_Purchase_Date__c',
+  'Dialer_Late_Payments__c': 'Has_Late_Payments__c',
+  'Dialer_Has_Bankrupted_or_Forclosure__c': 'Has_Bankrupted__c',
+  'Dialer_Lender_Name__c': 'Lender_Name__c',
+  'Dialer_Number_of_Mortgages__c': 'Number_Of_Mortgages__c',
+  'Dialer_Has_Second_Mortgage__c': 'Has_Second_Mortgage__c',
+  'Dialer_beginning_Loan_Amount__c': 'beginning_Loan_Amount__c',
+  'PurchasePrice__c': 'Purchase_Price__c',
+  'Dialer_Estimated_Appraised_Value__c': 'Estimated_Appraised_Value__c',
+  'Dialer_Interest_Rate__c': 'Interest_Rate__c',
+  'Dialer_Current_Interest__c': 'Current_Interest__c',
+  'Dialer_Mortgage_Start_Date__c': 'Mortgage_Start_Date__c',
+  'Dialer_Mortgage_Term__c': 'Mortgage_Term__c',
+  'Dialer_LTV__c': 'LTV__c',
+  'Dialer_Current_Loan_Type__c': 'Current_Loan_Type__c',
+  'Dialer_Current_Balance__c': 'Current_Balance__c',
+  'Dialer_Current_Monthly_Payment__c': 'Current_Monthly_Payment__c',
+  'Dialer_Current_FHA_Loan__c': 'Current_FHA_Loan__c',
+  'Dialer_Estimated_Property_Value__c': 'Property_Value__c',
+  'Dialer_Year_Built__c': 'Year_Built__c',
+  'Property_Type__c': 'Property_Type__c',
+  'Property_Use__c': 'Property_Use__c',
+  'Dialer_Lead_Generator_Notes__c': 'Lead_Generator_Notes__c',
+};
+
+// Fields where we hardcode a value instead of copying from the Lead
+const HARDCODED_CONTACT_FIELDS = {
+  'Transfer_or_Self_Gen__c': 'Transfer',
+  'Transfer__c': true,
+};
+
+// ============================================================
+// SALESFORCE AUTH (client_credentials OAuth flow, auto-refreshes)
+// ============================================================
+let sfAuth = {
+  accessToken: null,
+  instanceUrl: null,
+  expiresAt: 0,
+};
+
+async function getSfAccessToken() {
+  if (sfAuth.accessToken && Date.now() < sfAuth.expiresAt) {
+    return sfAuth;
+  }
+
+  console.log('[SF Auth] Requesting new access token...');
+
+  try {
+    const response = await axios.post(`${CONFIG.sfLoginUrl}/services/oauth2/token`, null, {
+      params: {
+        grant_type: 'client_credentials',
+        client_id: CONFIG.sfClientId,
+        client_secret: CONFIG.sfClientSecret,
+      },
+    });
+
+    sfAuth = {
+      accessToken: response.data.access_token,
+      instanceUrl: response.data.instance_url,
+      expiresAt: Date.now() + (90 * 60 * 1000), // refresh every 90 min
+    };
+
+    console.log(`[SF Auth] Success! Instance: ${sfAuth.instanceUrl}`);
+    return sfAuth;
+  } catch (error) {
+    console.error('[SF Auth] Failed:', error.response?.data || error.message);
+    throw new Error('Salesforce authentication failed');
+  }
+}
+
+// ============================================================
+// SALESFORCE API HELPERS
+// ============================================================
+
+// Look up a Salesforce User ID by email
+async function sfLookupUserByEmail(email) {
+  const { accessToken, instanceUrl } = await getSfAccessToken();
+
+  const query = `SELECT Id, Name FROM User WHERE Email = '${email}' AND IsActive = true LIMIT 1`;
+
+  try {
+    const response = await axios.get(`${instanceUrl}/services/data/v59.0/query`, {
+      params: { q: query },
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+
+    if (response.data.totalSize > 0) {
+      const user = response.data.records[0];
+      console.log(`[SF] Found user: ${user.Name} (${user.Id}) for email ${email}`);
+      return user.Id;
+    }
+
+    console.warn(`[SF] No active Salesforce user found for email: ${email}`);
+    return null;
+  } catch (error) {
+    console.error('[SF] User lookup failed:', error.response?.data || error.message);
+    return null;
+  }
+}
+
+// Fetch Lead data by ID
+async function sfGetLead(leadId) {
+  const { accessToken, instanceUrl } = await getSfAccessToken();
+
+  // Collect all unique Lead field names we need
+  const leadFields = new Set();
+  for (const [contactField, leadField] of Object.entries(LEAD_TO_CONTACT_MAP)) {
+    if (HARDCODED_CONTACT_FIELDS[contactField]) continue;
+    leadFields.add(leadField);
+  }
+
+  const fieldList = Array.from(leadFields).join(',');
+
+  try {
+    const response = await axios.get(
+      `${instanceUrl}/services/data/v59.0/sobjects/Lead/${leadId}`,
+      {
+        params: { fields: fieldList },
+        headers: { Authorization: `Bearer ${accessToken}` },
+      }
+    );
+
+    console.log(`[SF] Fetched Lead: ${response.data.FirstName || ''} ${response.data.LastName || ''} (${leadId})`);
+    return response.data;
+  } catch (error) {
+    console.error('[SF] Lead fetch failed:', error.response?.data || error.message);
+    return null;
+  }
+}
+
+// Create a Contact from Lead data with agent as owner
+async function sfCreateContact(leadData, ownerId, five9AgentName) {
+  const { accessToken, instanceUrl } = await getSfAccessToken();
+
+  const contactRecord = {};
+
+  // Map fields from Lead to Contact
+  for (const [contactField, leadField] of Object.entries(LEAD_TO_CONTACT_MAP)) {
+    // Use hardcoded value if defined
+    if (HARDCODED_CONTACT_FIELDS[contactField]) {
+      contactRecord[contactField] = HARDCODED_CONTACT_FIELDS[contactField];
+      continue;
+    }
+
+    // Copy value from Lead if it exists
+    const value = leadData[leadField];
+    if (value !== null && value !== undefined && value !== '') {
+      contactRecord[contactField] = value;
+    }
+  }
+
+  // Apply all hardcoded fields (catches any not in the mapping loop)
+  for (const [field, value] of Object.entries(HARDCODED_CONTACT_FIELDS)) {
+    contactRecord[field] = value;
+  }
+
+  // Set the owner to the Dialpad agent who answered
+  contactRecord['LoanPartner__c'] = ownerId;
+
+  // Set the Five9 agent name as the Telemarketer
+  if (five9AgentName) {
+    contactRecord['Telemarketer__c'] = five9AgentName;
+  }
+
+  console.log(`[SF] Creating Contact with ${Object.keys(contactRecord).length} fields, owner: ${ownerId}`);
+  console.log(`[SF] Contact preview: ${contactRecord.FirstName__c || ''} ${contactRecord.LastName__c || ''}, phone: ${contactRecord.Phone_1__c || 'N/A'}`);
+
+  try {
+    const response = await axios.post(
+      `${instanceUrl}/services/data/v59.0/sobjects/Contact`,
+      contactRecord,
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+      }
+    );
+
+    console.log(`[SF] Contact created! ID: ${response.data.id}`);
+    return response.data.id;
+  } catch (error) {
+    console.error('[SF] Contact creation failed:', JSON.stringify(error.response?.data || error.message, null, 2));
+    return null;
+  }
+}
+
+// Full workflow: Lead -> Contact with agent as owner
+async function convertLeadToContact(leadId, agentEmail, five9AgentName) {
+  console.log(`[Convert] Starting: Lead ${leadId}, agent ${agentEmail}, five9Agent: ${five9AgentName || 'N/A'}`);
+
+  // Step 1: Look up SF User by Dialpad agent's email
+  const ownerId = await sfLookupUserByEmail(agentEmail);
+  if (!ownerId) {
+    console.error(`[Convert] Cannot proceed - no SF user found for ${agentEmail}`);
+    return null;
+  }
+
+  // Step 2: Fetch the Lead
+  const leadData = await sfGetLead(leadId);
+  if (!leadData) {
+    console.error(`[Convert] Cannot proceed - Lead ${leadId} not found`);
+    return null;
+  }
+
+  // Step 3: Create the Contact
+  const contactId = await sfCreateContact(leadData, ownerId, five9AgentName);
+  if (!contactId) {
+    console.error('[Convert] Contact creation failed');
+    return null;
+  }
+
+  console.log(`[Convert] Success! Lead ${leadId} -> Contact ${contactId}, owner: ${agentEmail}`);
+  return contactId;
+}
+
+// ============================================================
+// MIDDLEWARE
+// ============================================================
+// Dialpad sends the JWT as a raw string body — capture it before JSON parsing
+app.use('/dialpad/call-events', express.text({ type: '*/*' }));
+
+// Parse JSON bodies for all other routes
+app.use(express.json());
+
+// Parse URL-encoded bodies (some connectors send form data)
+app.use(express.urlencoded({ extended: true }));
+
+// Request logging
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+  next();
+});
+
+// ============================================================
+// HELPER: Build Salesforce Lightning record URL
+// Maps record ID prefixes to their SObject type
+// ============================================================
+function sfRecordUrl(recordId) {
+  const prefixMap = {
+    '003': 'Contact',
+    '00Q': 'Lead',
+    '001': 'Account',
+    '006': 'Opportunity',
+    '005': 'User',
+  };
+  const prefix = (recordId || '').substring(0, 3);
+  const sobject = prefixMap[prefix] || 'Contact';
+  return `${CONFIG.salesforceBaseUrl}/lightning/r/${sobject}/${recordId}/view`;
+}
+
+// ============================================================
+// HELPER: Normalize phone number to E.164-ish format
+// Strips everything except digits and leading +
+// ============================================================
+function normalizePhone(phone) {
+  if (!phone) return null;
+  let cleaned = phone.replace(/[^\d+]/g, '');
+  // If it's 10 digits (US), prepend +1
+  if (/^\d{10}$/.test(cleaned)) {
+    cleaned = '+1' + cleaned;
+  }
+  // Ensure leading +
+  if (!cleaned.startsWith('+')) {
+    cleaned = '+' + cleaned;
+  }
+  return cleaned;
+}
+
+// ============================================================
+// HELPER: Trigger Dialpad screen pop for a user
+// ============================================================
+async function triggerScreenPop(dialpadUserId, salesforceRecordId) {
+  const url = sfRecordUrl(salesforceRecordId);
+
+  console.log(`[ScreenPop] Triggering for user ${dialpadUserId} -> ${url}`);
+
+  try {
+    const response = await axios.post(
+      `https://dialpad.com/api/v2/users/${dialpadUserId}/screenpop`,
+      { screen_pop_uri: url },
+      {
+        headers: {
+          'Authorization': `Bearer ${CONFIG.dialpadApiKey}`,
+          'Content-Type': 'application/json',
+        },
+      }
+    );
+    console.log(`[ScreenPop] Success! Status: ${response.status}`);
+    return true;
+  } catch (error) {
+    console.error(`[ScreenPop] Failed:`, error.response?.data || error.message);
+    return false;
+  }
+}
+
+// ============================================================
+// HELPER: Decode Dialpad JWT webhook payload
+// Dialpad sends the entire body as a JWT string when a secret is set.
+// The /dialpad/call-events route uses express.text() so req.body is a string.
+// ============================================================
+function decodeDialpadPayload(req, secret) {
+  const raw = req.body;
+
+  console.log('[JWT] Body type:', typeof raw, '| Length:', String(raw).length);
+  console.log('[JWT] Preview:', String(raw).substring(0, 80));
+
+  // If no secret, treat as plain JSON
+  if (!secret) {
+    if (typeof raw === 'string') {
+      try { return JSON.parse(raw); } catch (e) { return raw; }
+    }
+    return raw;
+  }
+
+  // Get the token string
+  let token = typeof raw === 'string' ? raw.trim() : '';
+
+  // If body was parsed as JSON by Express, the JWT might be in a field
+  if (!token && typeof req.body === 'object') {
+    token = req.body.token || JSON.stringify(req.body);
+  }
+
+  if (!token) {
+    console.error('[JWT] No raw body available for verification');
+    return null;
+  }
+
+  console.log('[JWT] Token preview:', token.substring(0, 50) + '...');
+
+  try {
+    return jwt.verify(token, secret, { algorithms: ['HS256'] });
+  } catch (err) {
+    console.error('[JWT] Verification failed:', err.message);
+    return null;
+  }
+}
+
+// ============================================================
+// ROUTE 1: Five9 Connector Webhook
+// Five9 sends this when a call is being transferred to Dialpad
+//
+// Expected payload (configure in Five9 connector):
+// {
+//   "agent_name": "First Last"
+//   "phone": "+15551234567",      (caller's ANI)
+//   "salesforce_id": "001ABC123"  (the SF Lead/Contact record ID)
+// }
+// ============================================================
+app.post('/five9/transfer', async (req, res) => {
+  console.log('[Five9] Received transfer data:', JSON.stringify(req.body));
+
+  // Optional: verify Five9 shared secret
+  if (CONFIG.five9Secret) {
+    const authHeader = req.headers['authorization'] || '';
+    const token = authHeader.replace('Bearer ', '');
+    if (token !== CONFIG.five9Secret) {
+      console.warn('[Five9] Invalid secret - rejecting request');
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+  }
+
+  const phone = normalizePhone(req.body.phone || req.body.ani || req.body.caller_id);
+  const salesforceId = req.body.salesforce_id || req.body.sf_id || req.body.record_id;
+  const agentName = req.body.agent_name || 'None';
+
+  if (!phone || !salesforceId) {
+    console.error('[Five9] Missing phone or salesforce_id in payload');
+    return res.status(400).json({
+      error: 'Missing required fields',
+      required: ['phone', 'salesforce_id'],
+      received: req.body,
+    });
+  }
+
+  // Cache the mapping in Redis with 5-minute TTL
+  try {
+    await redis.setex(
+      `${REDIS_PREFIX}${phone}`,
+      CONFIG.cacheTtlSec,
+      JSON.stringify({ salesforceId, agentName, timestamp: Date.now() })
+    );
+    console.log(`[Five9] Cached: ${phone} -> ${salesforceId} (agent: ${agentName || 'N/A'})`);
+    res.status(200).json({ status: 'ok', phone, salesforceId, agentName });
+  } catch (err) {
+    console.error('[Five9] Redis write failed:', err.message);
+    res.status(500).json({ error: 'Cache write failed' });
+  }
+});
+
+// ============================================================
+// ROUTE 2: Dialpad Call Event Webhook
+// Dialpad sends this when a call reaches the "connected" state
+// ============================================================
+app.post('/dialpad/call-events', async (req, res) => {
+  // Decode the payload
+  let payload;
+  try {
+    if (CONFIG.dialpadWebhookSecret) {
+      payload = decodeDialpadPayload(req, CONFIG.dialpadWebhookSecret);
+      if (!payload) {
+        console.error('[Dialpad] Could not decode JWT payload');
+        return res.status(400).json({ status: 'error', message: 'JWT decode failed' });
+      }
+    } else {
+      // No secret — body is a raw text string from express.text(), parse it
+      payload = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+    }
+  } catch (err) {
+    console.error('[Dialpad] Payload parse error:', err.message);
+    return res.status(400).json({ status: 'error', message: 'Invalid payload' });
+  }
+
+  // Log all phone-related fields for debugging
+  console.log(`[Dialpad] Call event: state=${payload.state}, direction=${payload.direction}`);
+  console.log(`[Dialpad]   external_number: ${payload.external_number}`);
+  console.log(`[Dialpad]   internal_number: ${payload.internal_number}`);
+  console.log(`[Dialpad]   contact.phone: ${payload.contact?.phone}`);
+  console.log(`[Dialpad]   target.id: ${payload.target?.id}, target.name: ${payload.target?.name}`);
+  console.log(`[Dialpad]   Full payload keys: ${Object.keys(payload).join(', ')}`);
+
+  // Only process "connected" events
+  if (payload.state !== 'connected') {
+    console.log(`[Dialpad] Ignoring state: ${payload.state}`);
+    return res.status(200).json({ status: 'ignored', reason: `state=${payload.state}` });
+  }
+
+  // For inbound calls: external_number is the caller (ANI)
+  // For outbound calls: external_number is the number being called
+  const callerPhone = normalizePhone(payload.external_number);
+  const agentId = payload.target?.id;
+  const agentName = payload.target?.name || 'Unknown';
+  const agentEmail = payload.target?.email || '';
+
+  if (!callerPhone) {
+    console.error('[Dialpad] No external_number in payload');
+    return res.status(200).json({ status: 'skipped', reason: 'no external_number' });
+  }
+
+  if (!agentId) {
+    console.error('[Dialpad] No target.id (agent ID) in payload');
+    return res.status(200).json({ status: 'skipped', reason: 'no agent ID' });
+  }
+
+  console.log(`[Dialpad] Call answered by ${agentName} (${agentId}, ${agentEmail}) from ${callerPhone}`);
+
+  // Look up the caller in our Redis cache (from Five9 data)
+  let cached;
+  try {
+    const raw = await redis.get(`${REDIS_PREFIX}${callerPhone}`);
+    cached = raw ? JSON.parse(raw) : null;
+  } catch (err) {
+    console.error('[Dialpad] Redis read failed:', err.message);
+    return res.status(200).json({ status: 'error', reason: 'cache read failed' });
+  }
+
+  if (!cached) {
+    console.log(`[Dialpad] No Five9 data cached for ${callerPhone} - skipping`);
+    return res.status(200).json({ status: 'skipped', reason: 'no cached data for caller' });
+  }
+
+  console.log(`[Dialpad] Found cached Salesforce Lead ID: ${cached.salesforceId}`);
+
+  // --- Lead to Contact Conversion ---
+  if (!agentEmail) {
+    console.warn('[Dialpad] No agent email in payload - cannot set Contact owner');
+    return res.status(200).json({
+      status: 'skipped',
+      reason: 'no agent email',
+      leadId: cached.salesforceId,
+      leadUrl: sfRecordUrl(cached.salesforceId),
+    });
+  }
+
+  const contactId = await convertLeadToContact(cached.salesforceId, agentEmail, cached.agentName);
+
+  if (contactId) {
+    const contactUrl = sfRecordUrl(contactId);
+    console.log(`[Dialpad] Contact ${contactId} created for call from ${callerPhone}`);
+
+    // Trigger screen pop to open the new Contact in the agent's browser
+    await triggerScreenPop(agentId, contactId);
+
+    // Remove from cache after successful conversion
+    await redis.del(`${REDIS_PREFIX}${callerPhone}`).catch(() => {});
+
+    return res.status(200).json({
+      status: 'ok',
+      screen_pop_uri: contactUrl,
+      contactId,
+      contactUrl,
+      leadId: cached.salesforceId,
+      agent: agentEmail,
+    });
+  }
+
+  // Conversion failed — screen pop the Lead instead
+  await triggerScreenPop(agentId, cached.salesforceId);
+
+  return res.status(200).json({
+    status: 'error',
+    reason: 'contact creation failed',
+    screen_pop_uri: sfRecordUrl(cached.salesforceId),
+    leadId: cached.salesforceId,
+  });
+});
+
+// ============================================================// ROUTE 3: Screen Pop Redirect
+// Dialpad opens this URL when a call is answered.
+// We look up the phone in our cache and redirect to Salesforce.
+// Set Dialpad Screen Pop URL to:
+//   https://dialpad-dev.pros.mortgage/screenpop/redirect?phone=%CN
+// ============================================================
+app.get('/screenpop/redirect', async (req, res) => {
+  const phone = normalizePhone(req.query.phone);
+  console.log(`[Redirect] Screen pop request for phone: ${phone}`);
+
+  if (!phone) {
+    return res.send('<html><body><script>window.close();</script></body></html>');
+  }
+
+  try {
+    const raw = await redis.get(`${REDIS_PREFIX}${phone}`);
+    if (raw) {
+      const data = JSON.parse(raw);
+      const sfUrl = sfRecordUrl(data.salesforceId);
+      console.log(`[Redirect] Found! Redirecting to ${sfUrl}`);
+      await redis.del(`${REDIS_PREFIX}${phone}`);
+      return res.redirect(sfUrl);
+    }
+  } catch (err) {
+    console.error('[Redirect] Redis read failed:', err.message);
+  }
+
+  // No cached data — close the tab Dialpad opened
+  console.log(`[Redirect] No cached data for ${phone}, closing tab`);
+  return res.send('<html><body><script>window.close();</script></body></html>');
+});
+
+// ============================================================// ROUTE 3: Health check
+// ============================================================
+app.get('/health', async (req, res) => {
+  let cacheSize = 0;
+  let redisStatus = 'unknown';
+  try {
+    await redis.ping();
+    redisStatus = 'connected';
+    const keys = await redis.keys(`${REDIS_PREFIX}*`);
+    cacheSize = keys.length;
+  } catch {
+    redisStatus = 'disconnected';
+  }
+  res.json({
+    status: redisStatus === 'connected' ? 'ok' : 'degraded',
+    uptime: process.uptime(),
+    redis: redisStatus,
+    cacheSize,
+    sfAuthenticated: !!sfAuth.accessToken && Date.now() < sfAuth.expiresAt,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// ============================================================
+// ROUTE 4: Debug - view current cache (JSON API)
+// ============================================================
+app.get('/debug/cache', async (req, res) => {
+  try {
+    const keys = await redis.keys(`${REDIS_PREFIX}*`);
+    const entries = [];
+    for (const key of keys) {
+      const raw = await redis.get(key);
+      if (!raw) continue;
+      const data = JSON.parse(raw);
+      const ttl = await redis.ttl(key);
+      entries.push({
+        phone: key.replace(REDIS_PREFIX, ''),
+        salesforceId: data.salesforceId,
+        age: `${Math.round((Date.now() - data.timestamp) / 1000)}s ago`,
+        ttlRemaining: `${ttl}s`,
+      });
+    }
+    res.json({ cacheSize: keys.length, entries });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to read cache', detail: err.message });
+  }
+});
+
+// ============================================================
+// ROUTE 5: Admin page - view cached data in a browser
+// ============================================================
+app.get('/admin', async (req, res) => {
+  let rows = '';
+  let cacheSize = 0;
+  let redisStatus = 'disconnected';
+
+  try {
+    await redis.ping();
+    redisStatus = 'connected';
+    const keys = await redis.keys(`${REDIS_PREFIX}*`);
+    cacheSize = keys.length;
+
+    for (const key of keys) {
+      const raw = await redis.get(key);
+      if (!raw) continue;
+      const data = JSON.parse(raw);
+      const ttl = await redis.ttl(key);
+      const ageSec = Math.round((Date.now() - data.timestamp) / 1000);
+      rows += `<tr>
+        <td>${key.replace(REDIS_PREFIX, '')}</td>
+        <td><a href="${sfRecordUrl(data.salesforceId)}" target="_blank">${data.salesforceId}</a></td>
+        <td>${ageSec}s ago</td>
+        <td>${ttl}s</td>
+      </tr>`;
+    }
+  } catch (err) {
+    rows = `<tr><td colspan="4" style="color:#e74c3c">Redis error: ${err.message}</td></tr>`;
+  }
+
+  if (cacheSize === 0 && redisStatus === 'connected') {
+    rows = '<tr><td colspan="4" style="color:#888">No cached entries — waiting for Five9 data</td></tr>';
+  }
+
+  res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="5">
+  <title>Screen Pop Admin</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f1117; color: #e0e0e0; padding: 24px; }
+    h1 { font-size: 20px; margin-bottom: 4px; }
+    .meta { color: #888; font-size: 13px; margin-bottom: 20px; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; }
+    .badge.ok { background: #1a3a2a; color: #4ade80; }
+    .badge.bad { background: #3a1a1a; color: #f87171; }
+    table { width: 100%; border-collapse: collapse; }
+    th { text-align: left; padding: 10px 12px; background: #1a1d27; color: #aaa; font-size: 12px; text-transform: uppercase; letter-spacing: .5px; border-bottom: 1px solid #2a2d37; }
+    td { padding: 10px 12px; border-bottom: 1px solid #1e2130; font-size: 14px; font-family: "SF Mono", "Fira Code", monospace; }
+    tr:hover td { background: #1a1d27; }
+    a { color: #60a5fa; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .footer { margin-top: 16px; font-size: 12px; color: #555; }
+  </style>
+</head>
+<body>
+  <h1>Dialpad Screen Pop — Cache</h1>
+  <p class="meta">
+    Redis: <span class="badge ${redisStatus === 'connected' ? 'ok' : 'bad'}">${redisStatus}</span>
+    &nbsp; Entries: <strong>${cacheSize}</strong>
+    &nbsp; TTL: ${CONFIG.cacheTtlSec}s
+  </p>
+  <table>
+    <thead><tr><th>Phone (ANI)</th><th>Salesforce ID</th><th>Age</th><th>TTL Left</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>
+  <p class="footer">Auto-refreshes every 5 seconds</p>
+</body>
+</html>`);
+});
+
+// ============================================================
+// START SERVER
+// ============================================================
+app.listen(CONFIG.port, () => {
+  console.log('='.repeat(60));
+  console.log(`  Dialpad Screen Pop Middleware`);
+  console.log(`  Listening on port ${CONFIG.port}`);
+  console.log(`  Redis:            ${CONFIG.redisUrl}`);
+  console.log(`  Cache TTL:        ${CONFIG.cacheTtlSec}s`);
+  console.log(`  Five9 webhook:    POST /five9/transfer`);
+  console.log(`  Dialpad webhook:  POST /dialpad/call-events`);
+  console.log(`  Screen pop:       GET  /screenpop/redirect`);
+  console.log(`  Health check:     GET  /health`);
+  console.log('='.repeat(60));
+
+  // Test Salesforce auth on startup
+  if (CONFIG.sfClientId) {
+    getSfAccessToken()
+      .then(() => console.log('[Startup] Salesforce auth: OK'))
+      .catch(() => console.error('[Startup] Salesforce auth: FAILED - check credentials'));
+  } else {
+    console.warn('[Startup] Salesforce credentials not configured - Lead conversion disabled');
+  }
+});
