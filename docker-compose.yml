@@ -3,12 +3,15 @@ version: "3.8"
 services:
   redis:
     image: redis:7-alpine
-    container_name: dialpad-screenpop-redis
-    restart: unless-stopped
     networks:
       - dialpad-screen-pop
     volumes:
       - redis-data:/data
+    restart: unless-stopped
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -16,29 +19,33 @@ services:
       retries: 3
 
   dialpad-screenpop:
-    image: ghostreaper69/dialpad-screen-pop:v0.0.16
+    image: ghostreaper69/dialpad-screen-pop:v0.0.20
     restart: unless-stopped
     depends_on:
-      redis:
-        condition: service_healthy
+      - redis
     deploy:
-      replicas: 2
+      replicas: 3
       update_config:
         parallelism: 1
         delay: 10s
+        monitor: 30s
         order: start-first
+        failure_action: rollback
       restart_policy:
         condition: on-failure
-    labels:
-      - traefik.enable=true
-      - traefik.docker.network=traefik
-      - traefik.http.routers.dialpad-screen-pop.rule=Host(`<your_hostname`)
-      - traefik.http.routers.dialpad-screen-pop.entrypoints=websecure
-      - traefik.http.routers.dialpad-screen-pop.tls.certresolver=letsencrypt
-      - traefik.http.services.dialpad-screen-pop.loadbalancer.server.port=3500
-      - traefik.http.services.dialpad-screen-pop.loadbalancer.healthcheck.path=/health
-      - traefik.http.services.dialpad-screen-pop.loadbalancer.healthcheck.interval=10s
-      - traefik.http.services.dialpad-screen-pop.loadbalancer.healthcheck.timeout=3s
+      labels:
+        - traefik.enable=true
+        - traefik.swarm.network=traefik_traefik-swarm
+        - traefik.http.routers.dialpad-screen-pop.rule=Host(`<your-hostname-here`)
+        - traefik.http.routers.dialpad-screen-pop.entrypoints=websecure
+        - traefik.http.routers.dialpad-screen-pop.tls.certresolver=letsencrypt
+        - traefik.http.services.dialpad-screen-pop.loadbalancer.server.port=3500
+        - traefik.http.services.dialpad-screen-pop.loadbalancer.healthcheck.path=/health
+        - traefik.http.services.dialpad-screen-pop.loadbalancer.healthcheck.interval=3s
+        - traefik.http.services.dialpad-screen-pop.loadbalancer.healthcheck.timeout=1s
+    networks:
+    - dialpad-screen-pop
+    - traefik_traefik-swarm
     environment:
       - PORT=3500
       - REDIS_URL=redis://redis:6379
@@ -51,18 +58,16 @@ services:
       - SF_CLIENT_SECRET=
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:3500/health"]
-      interval: 10s
+      interval: 5s
       timeout: 5s
       retries: 3
-    networks:
-      - dialpad-screen-pop
-      - traefik
 
 volumes:
   redis-data:
     driver: local
 networks:
   dialpad-screen-pop:
-    driver: bridge
-  traefik:
+    driver: overlay
+    attachable: true
+  traefik_traefik-swarm:
     external: true

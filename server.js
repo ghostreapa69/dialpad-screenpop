@@ -54,6 +54,45 @@ redis.on('error', (err) => console.error('[Redis] Error:', err.message));
 redis.on('close', () => console.warn('[Redis] Connection closed'));
 
 const REDIS_PREFIX = 'screenpop:';
+const LOG_KEY = 'calllog';
+const MAX_LOG_ENTRIES = 500;
+
+// ============================================================
+// HELPER: Append a call log entry to Redis
+// ============================================================
+async function logCall(type, phone, details = {}) {
+  const entry = {
+    type,
+    phone: phone || 'N/A',
+    timestamp: Date.now(),
+    time: new Date().toISOString(),
+    ...details,
+  };
+  try {
+    await redis.lpush(LOG_KEY, JSON.stringify(entry));
+    await redis.ltrim(LOG_KEY, 0, MAX_LOG_ENTRIES - 1);
+  } catch (err) {
+    console.error('[Log] Failed to write log:', err.message);
+  }
+}
+
+// ============================================================
+// HELPER: Format a timestamp to Eastern Time (12-hour format)
+// Automatically adjusts for EST/EDT daylight savings
+// ============================================================
+function formatEastern(isoOrTimestamp) {
+  const d = new Date(isoOrTimestamp);
+  return d.toLocaleString('en-US', {
+    timeZone: 'America/New_York',
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: true,
+  });
+}
 
 // ============================================================
 // LEAD -> CONTACT FIELD MAPPING
@@ -225,7 +264,7 @@ async function sfGetLead(leadId) {
 }
 
 // Create a Contact from Lead data with agent as owner
-async function sfCreateContact(leadData, ownerId, five9AgentName) {
+async function sfCreateContact(leadData, ownerId, five9AgentName, leadId) {
   const { accessToken, instanceUrl } = await getSfAccessToken();
 
   const contactRecord = {};
@@ -252,6 +291,11 @@ async function sfCreateContact(leadData, ownerId, five9AgentName) {
 
   // Set the owner to the Dialpad agent who answered
   contactRecord['LoanPartner__c'] = ownerId;
+
+  // Link back to the original Lead
+  if (leadId) {
+    contactRecord['Original_Lead__c'] = leadId;
+  }
 
   // Set the Five9 agent name as the Telemarketer
   if (five9AgentName) {
@@ -300,7 +344,7 @@ async function convertLeadToContact(leadId, agentEmail, five9AgentName) {
   }
 
   // Step 3: Create the Contact
-  const contactId = await sfCreateContact(leadData, ownerId, five9AgentName);
+  const contactId = await sfCreateContact(leadData, ownerId, five9AgentName, leadId);
   if (!contactId) {
     console.error('[Convert] Contact creation failed');
     return null;
@@ -477,6 +521,7 @@ app.post('/five9/transfer', async (req, res) => {
       JSON.stringify({ salesforceId, agentName, timestamp: Date.now() })
     );
     console.log(`[Five9] Cached: ${phone} -> ${salesforceId} (agent: ${agentName || 'N/A'})`);
+    await logCall('Transfer', phone, { salesforceId, five9Agent: agentName });
     res.status(200).json({ status: 'ok', phone, salesforceId, agentName });
   } catch (err) {
     console.error('[Five9] Redis write failed:', err.message);
@@ -552,6 +597,7 @@ app.post('/dialpad/call-events', async (req, res) => {
 
   if (!cached) {
     console.log(`[Dialpad] No Five9 data cached for ${callerPhone} - skipping`);
+    await logCall('No Record Found', callerPhone, { dialpadAgent: agentName, agentEmail });
     return res.status(200).json({ status: 'skipped', reason: 'no cached data for caller' });
   }
 
@@ -573,6 +619,14 @@ app.post('/dialpad/call-events', async (req, res) => {
   if (contactId) {
     const contactUrl = sfRecordUrl(contactId);
     console.log(`[Dialpad] Contact ${contactId} created for call from ${callerPhone}`);
+    await logCall('Answer', callerPhone, {
+      salesforceId: cached.salesforceId,
+      contactId,
+      contactUrl,
+      dialpadAgent: agentName,
+      agentEmail,
+      five9Agent: cached.agentName,
+    });
 
     // Trigger screen pop to open the new Contact in the agent's browser
     await triggerScreenPop(agentId, contactId);
@@ -688,6 +742,7 @@ app.get('/admin', async (req, res) => {
   let rows = '';
   let cacheSize = 0;
   let redisStatus = 'disconnected';
+  let logRows = '';
 
   try {
     await redis.ping();
@@ -704,16 +759,43 @@ app.get('/admin', async (req, res) => {
       rows += `<tr>
         <td>${key.replace(REDIS_PREFIX, '')}</td>
         <td><a href="${sfRecordUrl(data.salesforceId)}" target="_blank">${data.salesforceId}</a></td>
+        <td>${data.agentName || 'N/A'}</td>
         <td>${ageSec}s ago</td>
         <td>${ttl}s</td>
       </tr>`;
     }
+
+    // Fetch call log entries
+    const logEntries = await redis.lrange(LOG_KEY, 0, MAX_LOG_ENTRIES - 1);
+    for (const entry of logEntries) {
+      try {
+        const log = JSON.parse(entry);
+        const badgeClass = log.type === 'Answer' ? 'answer' : log.type === 'Transfer' ? 'transfer' : 'norecord';
+        const sfLink = log.contactId
+          ? `<a href="${log.contactUrl}" target="_blank">${log.contactId}</a>`
+          : log.salesforceId
+            ? `<a href="${sfRecordUrl(log.salesforceId)}" target="_blank">${log.salesforceId}</a>`
+            : '—';
+        const agent = log.dialpadAgent || log.five9Agent || '—';
+        const displayTime = formatEastern(log.time || log.timestamp) + ' EST';
+        logRows += `<tr data-type="${log.type || ''}" data-search="${(log.phone || '') + ' ' + (log.type || '') + ' ' + agent + ' ' + (log.salesforceId || '') + ' ' + (log.contactId || '')}">
+          <td><span class="log-badge ${badgeClass}">${log.type}</span></td>
+          <td>${log.phone || '—'}</td>
+          <td>${sfLink}</td>
+          <td>${agent}</td>
+          <td>${displayTime}</td>
+        </tr>`;
+      } catch (e) { /* skip malformed */ }
+    }
   } catch (err) {
-    rows = `<tr><td colspan="4" style="color:#e74c3c">Redis error: ${err.message}</td></tr>`;
+    rows = `<tr><td colspan="5" style="color:#e74c3c">Redis error: ${err.message}</td></tr>`;
   }
 
   if (cacheSize === 0 && redisStatus === 'connected') {
-    rows = '<tr><td colspan="4" style="color:#888">No cached entries — waiting for Five9 data</td></tr>';
+    rows = '<tr><td colspan="5" style="color:#888">No cached entries — waiting for Five9 data</td></tr>';
+  }
+  if (!logRows) {
+    logRows = '<tr><td colspan="5" style="color:#888">No log entries yet</td></tr>';
   }
 
   res.send(`<!DOCTYPE html>
@@ -721,37 +803,201 @@ app.get('/admin', async (req, res) => {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="5">
   <title>Screen Pop Admin</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f1117; color: #e0e0e0; padding: 24px; }
+    html, body { height: 100%; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f1117; color: #e0e0e0; display: flex; flex-direction: column; }
     h1 { font-size: 20px; margin-bottom: 4px; }
+    h2 { font-size: 16px; margin-bottom: 8px; }
     .meta { color: #888; font-size: 13px; margin-bottom: 20px; }
     .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; }
     .badge.ok { background: #1a3a2a; color: #4ade80; }
     .badge.bad { background: #3a1a1a; color: #f87171; }
+    .log-badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; white-space: nowrap; }
+    .log-badge.answer { background: #1a3a2a; color: #4ade80; }
+    .log-badge.transfer { background: #1a2a3a; color: #60a5fa; }
+    .log-badge.norecord { background: #3a2a1a; color: #fbbf24; }
     table { width: 100%; border-collapse: collapse; }
     th { text-align: left; padding: 10px 12px; background: #1a1d27; color: #aaa; font-size: 12px; text-transform: uppercase; letter-spacing: .5px; border-bottom: 1px solid #2a2d37; }
     td { padding: 10px 12px; border-bottom: 1px solid #1e2130; font-size: 14px; font-family: "SF Mono", "Fira Code", monospace; }
     tr:hover td { background: #1a1d27; }
     a { color: #60a5fa; text-decoration: none; }
     a:hover { text-decoration: underline; }
-    .footer { margin-top: 16px; font-size: 12px; color: #555; }
+    .top-section { height: 40vh; padding: 24px 24px 16px; overflow-y: auto; flex-shrink: 0; }
+    .log-panel { height: 60vh; background: #13151d; border-top: 1px solid #2a2d37; display: flex; flex-direction: column; flex-shrink: 0; }
+    .log-header { display: flex; align-items: center; justify-content: space-between; padding: 12px 24px; flex-shrink: 0; }
+    .log-header h2 { margin: 0; }
+    .search-box { padding: 0 24px 8px; flex-shrink: 0; }
+    .search-box input { background: #1a1d27; border: 1px solid #2a2d37; color: #e0e0e0; padding: 8px 12px; border-radius: 6px; font-size: 13px; width: 300px; outline: none; }
+    .search-box input:focus { border-color: #60a5fa; }
+    .filter-bar { display: flex; gap: 12px; align-items: center; padding: 0 24px 8px; flex-shrink: 0; }
+    .filter-bar input { background: #1a1d27; border: 1px solid #2a2d37; color: #e0e0e0; padding: 8px 12px; border-radius: 6px; font-size: 13px; width: 300px; outline: none; }
+    .filter-bar input:focus { border-color: #60a5fa; }
+    .type-filter { position: relative; }
+    .type-filter-btn { background: #1a1d27; border: 1px solid #2a2d37; color: #e0e0e0; padding: 8px 14px; border-radius: 6px; font-size: 13px; cursor: pointer; display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+    .type-filter-btn:hover { border-color: #60a5fa; }
+    .type-filter-btn .arrow { font-size: 10px; }
+    .type-dropdown { display: none; position: absolute; bottom: 100%; left: 0; margin-bottom: 4px; background: #1a1d27; border: 1px solid #2a2d37; border-radius: 6px; padding: 6px 0; min-width: 180px; z-index: 200; box-shadow: 0 -4px 12px rgba(0,0,0,.4); }
+    .type-dropdown.show { display: block; }
+    .type-dropdown label { display: flex; align-items: center; gap: 8px; padding: 6px 14px; font-size: 13px; cursor: pointer; white-space: nowrap; }
+    .type-dropdown label:hover { background: #252838; }
+    .type-dropdown input[type=checkbox] { accent-color: #60a5fa; }
+    .type-dropdown .divider { height: 1px; background: #2a2d37; margin: 4px 0; }
+    .log-content { overflow-y: auto; flex: 1; padding: 0 24px 12px; }
   </style>
 </head>
 <body>
-  <h1>Dialpad Screen Pop — Cache</h1>
-  <p class="meta">
-    Redis: <span class="badge ${redisStatus === 'connected' ? 'ok' : 'bad'}">${redisStatus}</span>
-    &nbsp; Entries: <strong>${cacheSize}</strong>
-    &nbsp; TTL: ${CONFIG.cacheTtlSec}s
-  </p>
-  <table>
-    <thead><tr><th>Phone (ANI)</th><th>Salesforce ID</th><th>Age</th><th>TTL Left</th></tr></thead>
-    <tbody>${rows}</tbody>
-  </table>
-  <p class="footer">Auto-refreshes every 5 seconds</p>
+  <div class="top-section">
+    <h1>Dialpad Screen Pop — Admin</h1>
+    <p class="meta">
+      Redis: <span class="badge ${redisStatus === 'connected' ? 'ok' : 'bad'}">${redisStatus}</span>
+      &nbsp; Cached: <strong>${cacheSize}</strong>
+      &nbsp; TTL: ${CONFIG.cacheTtlSec}s
+    </p>
+
+    <h2>Active Cache</h2>
+    <table>
+      <thead><tr><th>Phone (ANI)</th><th>Salesforce ID</th><th>Five9 Agent</th><th>Age</th><th>TTL Left</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  </div>
+
+  <div class="log-panel">
+    <div class="log-header">
+      <h2>Call Log (last ${MAX_LOG_ENTRIES})</h2>
+    </div>
+    <div class="filter-bar">
+      <input type="text" id="logSearch" placeholder="Search by phone, agent, ID..." oninput="filterLog()">
+      <div class="type-filter">
+        <button class="type-filter-btn" onclick="toggleDropdown(event)">Type: All <span class="arrow">&#9650;</span></button>
+        <div class="type-dropdown" id="typeDropdown">
+          <label><input type="checkbox" value="All" checked onchange="toggleAll(this)"> All</label>
+          <div class="divider"></div>
+          <label><input type="checkbox" value="Transfer" checked onchange="toggleType(this)"> <span class="log-badge transfer">Transfer</span></label>
+          <label><input type="checkbox" value="Answer" checked onchange="toggleType(this)"> <span class="log-badge answer">Answer</span></label>
+          <label><input type="checkbox" value="No Record Found" checked onchange="toggleType(this)"> <span class="log-badge norecord">No Record Found</span></label>
+        </div>
+      </div>
+    </div>
+    <div class="log-content">
+      <table>
+        <thead><tr><th>Type</th><th>Phone</th><th>SF Record</th><th>Agent</th><th>Time</th></tr></thead>
+        <tbody id="logTable">${logRows}</tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    // --- State persistence across refresh ---
+    const STATE_KEY = 'adminFilterState';
+    function saveState() {
+      const state = {
+        search: document.getElementById('logSearch').value,
+        types: getSelectedTypes()
+      };
+      sessionStorage.setItem(STATE_KEY, JSON.stringify(state));
+    }
+    function restoreState() {
+      try {
+        const raw = sessionStorage.getItem(STATE_KEY);
+        if (!raw) return;
+        const state = JSON.parse(raw);
+        if (state.search) document.getElementById('logSearch').value = state.search;
+        if (state.types) {
+          const allTypes = ['Transfer', 'Answer', 'No Record Found'];
+          const checks = document.querySelectorAll('#typeDropdown input[type=checkbox]:not([value=All])');
+          checks.forEach(c => { c.checked = state.types.includes(c.value); });
+          const allBox = document.querySelector('#typeDropdown input[value=All]');
+          allBox.checked = state.types.length === allTypes.length;
+          updateBtnLabel();
+        }
+        filterLog();
+      } catch(e) {}
+    }
+
+    // --- Auto-refresh via fetch (no full page reload) ---
+    async function refreshData() {
+      try {
+        const resp = await fetch(window.location.href);
+        const html = await resp.text();
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(html, 'text/html');
+        // Update cache table
+        const newTop = doc.querySelector('.top-section');
+        if (newTop) document.querySelector('.top-section').innerHTML = newTop.innerHTML;
+        // Update log table body only
+        const newLogBody = doc.querySelector('#logTable');
+        if (newLogBody) document.getElementById('logTable').innerHTML = newLogBody.innerHTML;
+        filterLog();
+      } catch(e) {}
+    }
+    setInterval(refreshData, 10000);
+
+    // --- Type filter logic ---
+    function getSelectedTypes() {
+      const checks = document.querySelectorAll('#typeDropdown input[type=checkbox]:not([value=All])');
+      const selected = [];
+      checks.forEach(c => { if (c.checked) selected.push(c.value); });
+      return selected;
+    }
+
+    function updateBtnLabel() {
+      const btn = document.querySelector('.type-filter-btn');
+      const types = getSelectedTypes();
+      if (types.length === 3) {
+        btn.innerHTML = 'Type: All <span class="arrow">&#9650;</span>';
+      } else if (types.length === 0) {
+        btn.innerHTML = 'Type: None <span class="arrow">&#9650;</span>';
+      } else {
+        btn.innerHTML = 'Type: ' + types.join(', ') + ' <span class="arrow">&#9650;</span>';
+      }
+    }
+
+    function toggleAll(el) {
+      const checks = document.querySelectorAll('#typeDropdown input[type=checkbox]:not([value=All])');
+      checks.forEach(c => { c.checked = el.checked; });
+      updateBtnLabel();
+      filterLog();
+      saveState();
+    }
+
+    function toggleType(el) {
+      const checks = document.querySelectorAll('#typeDropdown input[type=checkbox]:not([value=All])');
+      const allBox = document.querySelector('#typeDropdown input[value=All]');
+      allBox.checked = [...checks].every(c => c.checked);
+      updateBtnLabel();
+      filterLog();
+      saveState();
+    }
+
+    function toggleDropdown(e) {
+      e.stopPropagation();
+      document.getElementById('typeDropdown').classList.toggle('show');
+    }
+
+    document.addEventListener('click', function(e) {
+      const dd = document.getElementById('typeDropdown');
+      if (!e.target.closest('.type-filter')) dd.classList.remove('show');
+    });
+
+    function filterLog() {
+      const q = document.getElementById('logSearch').value.toLowerCase();
+      const selected = getSelectedTypes();
+      const rows = document.querySelectorAll('#logTable tr[data-search]');
+      rows.forEach(row => {
+        const text = (row.getAttribute('data-search') || '').toLowerCase();
+        const type = row.getAttribute('data-type') || '';
+        const matchText = !q || text.includes(q);
+        const matchType = selected.includes(type);
+        row.style.display = (matchText && matchType) ? '' : 'none';
+      });
+      saveState();
+    }
+
+    // Restore saved state on load
+    restoreState();
+  </script>
 </body>
 </html>`);
 });
