@@ -19,7 +19,7 @@ services:
       retries: 3
 
   dialpad-screenpop:
-    image: ghostreaper69/dialpad-screen-pop:v0.0.20
+    image: ghostreaper69/dialpad-screen-pop:v0.0.22
     restart: unless-stopped
     depends_on:
       - redis

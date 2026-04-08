@@ -34,6 +34,11 @@ const CONFIG = {
   sfLoginUrl: process.env.SF_LOGIN_URL || 'https://login.salesforce.com',
   sfClientId: process.env.SF_CLIENT_ID || '',
   sfClientSecret: process.env.SF_CLIENT_SECRET || '',
+
+  // Enable/disable Dialpad Transfers Group membership check
+  // Set to 'true' to require agents to be in a "Transfers Group *" group
+  // Set to 'false' to skip the group check and allow all agents
+  requireTransfersGroup: (process.env.REQUIRE_TRANSFERS_GROUP || 'true').toLowerCase() === 'true',
 };
 
 // ============================================================
@@ -56,6 +61,7 @@ redis.on('close', () => console.warn('[Redis] Connection closed'));
 const REDIS_PREFIX = 'screenpop:';
 const LOG_KEY = 'calllog';
 const MAX_LOG_ENTRIES = 500;
+const LOG_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 1 week
 
 // ============================================================
 // HELPER: Append a call log entry to Redis
@@ -70,9 +76,58 @@ async function logCall(type, phone, details = {}) {
   };
   try {
     await redis.lpush(LOG_KEY, JSON.stringify(entry));
-    await redis.ltrim(LOG_KEY, 0, MAX_LOG_ENTRIES - 1);
   } catch (err) {
     console.error('[Log] Failed to write log:', err.message);
+  }
+}
+
+// ============================================================
+// HELPER: Trim log entries older than 1 week
+// Scans from the tail (oldest) and removes expired entries
+// ============================================================
+async function trimOldLogs() {
+  try {
+    const cutoff = Date.now() - LOG_MAX_AGE_MS;
+    const len = await redis.llen(LOG_KEY);
+    if (len === 0) return;
+
+    // Read entries from the tail (oldest) in batches
+    const BATCH = 200;
+    let removed = 0;
+    let idx = len - 1;
+
+    while (idx >= 0) {
+      const start = Math.max(idx - BATCH + 1, 0);
+      const entries = await redis.lrange(LOG_KEY, start, idx);
+
+      // Walk from oldest (last element) toward newest
+      let allOld = true;
+      for (let i = entries.length - 1; i >= 0; i--) {
+        try {
+          const log = JSON.parse(entries[i]);
+          const ts = log.timestamp || new Date(log.time).getTime();
+          if (ts < cutoff) {
+            removed++;
+          } else {
+            allOld = false;
+            break;
+          }
+        } catch (e) {
+          removed++; // remove malformed entries too
+        }
+      }
+
+      if (!allOld) break;
+      idx = start - 1;
+    }
+
+    if (removed > 0) {
+      // Trim the list to keep only the newest (len - removed) entries
+      await redis.ltrim(LOG_KEY, 0, len - removed - 1);
+      console.log(`[Log Cleanup] Removed ${removed} entries older than 7 days (${len - removed} remaining)`);
+    }
+  } catch (err) {
+    console.error('[Log Cleanup] Error:', err.message);
   }
 }
 
@@ -156,12 +211,14 @@ const LEAD_TO_CONTACT_MAP = {
   'Property_Type__c': 'Property_Type__c',
   'Property_Use__c': 'Property_Use__c',
   'Dialer_Lead_Generator_Notes__c': 'Lead_Generator_Notes__c',
+  'Lead_Type__c': 'Lead_Type__c',
 };
 
 // Fields where we hardcode a value instead of copying from the Lead
 const HARDCODED_CONTACT_FIELDS = {
   'Transfer_or_Self_Gen__c': 'Transfer',
   'Transfer__c': true,
+  'LeadSource': 'Dialer',
 };
 
 // ============================================================
@@ -408,6 +465,50 @@ function normalizePhone(phone) {
 }
 
 // ============================================================
+// HELPER: Check if a Dialpad user is a member of a "Transfers Group *" group
+// Uses the Dialpad API to fetch user details and check group memberships
+// ============================================================
+async function isUserInTransfersGroup(dialpadUserId) {
+  console.log(`[Dialpad] Checking group membership for user ${dialpadUserId}`);
+
+  try {
+    // Get user details including group memberships
+    const response = await axios.get(
+      `https://dialpad.com/api/v2/users/${dialpadUserId}`,
+      {
+        headers: {
+          'Authorization': `Bearer ${CONFIG.dialpadApiKey}`,
+        },
+      }
+    );
+
+    const user = response.data;
+    const groups = user.groups || [];
+
+    console.log(`[Dialpad] User ${user.display_name || dialpadUserId} belongs to ${groups.length} groups`);
+
+    // Check each group for "Transfers Group *" pattern (case-insensitive)
+    for (const group of groups) {
+      const groupName = group.name || '';
+      console.log(`[Dialpad]   - Group: "${groupName}"`);
+
+      // Match "Transfers Group" followed by anything (wildcard)
+      if (/^Transfers\s+Group\b/i.test(groupName)) {
+        console.log(`[Dialpad] ✓ User is in matching group: "${groupName}"`);
+        return { isMember: true, groupName };
+      }
+    }
+
+    console.log(`[Dialpad] ✗ User is NOT in any "Transfers Group *" group`);
+    return { isMember: false, groupName: null };
+  } catch (error) {
+    console.error(`[Dialpad] Group membership check failed:`, error.response?.data || error.message);
+    // On API error, we'll fail closed (not in group) to be safe
+    return { isMember: false, groupName: null, error: error.message };
+  }
+}
+
+// ============================================================
 // HELPER: Trigger Dialpad screen pop for a user
 // ============================================================
 async function triggerScreenPop(dialpadUserId, salesforceRecordId) {
@@ -614,6 +715,29 @@ app.post('/dialpad/call-events', async (req, res) => {
     });
   }
 
+  // --- Check if agent is in a "Transfers Group *" group (if enabled) ---
+  if (CONFIG.requireTransfersGroup) {
+    const groupCheck = await isUserInTransfersGroup(agentId);
+    if (!groupCheck.isMember) {
+      console.log(`[Dialpad] Agent ${agentEmail} is NOT in a Transfers Group - skipping contact creation`);
+      await logCall('Not In Transfers Group', callerPhone, {
+        dialpadAgent: agentName,
+        agentEmail,
+        agentId,
+        error: groupCheck.error || 'Not a member of any Transfers Group',
+      });
+      return res.status(200).json({
+        status: 'skipped',
+        reason: 'agent not in Transfers Group',
+        agentEmail,
+        leadId: cached.salesforceId,
+      });
+    }
+    console.log(`[Dialpad] Agent ${agentEmail} is in "${groupCheck.groupName}" - proceeding with contact creation`);
+  } else {
+    console.log(`[Dialpad] Transfers Group check disabled - proceeding with contact creation for ${agentEmail}`);
+  }
+
   const contactId = await convertLeadToContact(cached.salesforceId, agentEmail, cached.agentName);
 
   if (contactId) {
@@ -736,6 +860,54 @@ app.get('/debug/cache', async (req, res) => {
 });
 
 // ============================================================
+// ROUTE 5a: Search API - searches ALL log entries in Redis
+// ============================================================
+app.get('/api/logs/search', async (req, res) => {
+  try {
+    const q = (req.query.q || '').toLowerCase().trim();
+    const types = (req.query.types || '').split(',').filter(Boolean);
+
+    if (!q) return res.json([]);
+
+    // Fetch ALL log entries from Redis (no cap)
+    const allEntries = await redis.lrange(LOG_KEY, 0, -1);
+    const results = [];
+
+    for (const entry of allEntries) {
+      try {
+        const log = JSON.parse(entry);
+        const agent = log.dialpadAgent || log.five9Agent || '';
+        const searchText = [
+          log.phone || '',
+          log.type || '',
+          agent,
+          log.salesforceId || '',
+          log.contactId || '',
+        ].join(' ').toLowerCase();
+
+        const matchText = searchText.includes(q);
+        const matchType = types.length === 0 || types.includes(log.type);
+
+        if (matchText && matchType) {
+          results.push({
+            ...log,
+            dialpadAgent: log.dialpadAgent || null,
+            five9Agent: log.five9Agent || null,
+            displayTime: formatEastern(log.time || log.timestamp) + ' EST',
+            sfRecordUrl: log.salesforceId ? sfRecordUrl(log.salesforceId) : null,
+          });
+        }
+      } catch (e) { /* skip malformed */ }
+    }
+
+    res.json(results);
+  } catch (err) {
+    console.error('[Search] Error:', err.message);
+    res.status(500).json({ error: 'Search failed' });
+  }
+});
+
+// ============================================================
 // ROUTE 5: Admin page - view cached data in a browser
 // ============================================================
 app.get('/admin', async (req, res) => {
@@ -743,6 +915,7 @@ app.get('/admin', async (req, res) => {
   let cacheSize = 0;
   let redisStatus = 'disconnected';
   let logRows = '';
+  let totalLogCount = 0;
 
   try {
     await redis.ping();
@@ -765,7 +938,8 @@ app.get('/admin', async (req, res) => {
       </tr>`;
     }
 
-    // Fetch call log entries
+    // Fetch call log entries (last 500 for display; search API covers all)
+    totalLogCount = await redis.llen(LOG_KEY);
     const logEntries = await redis.lrange(LOG_KEY, 0, MAX_LOG_ENTRIES - 1);
     for (const entry of logEntries) {
       try {
@@ -865,7 +1039,7 @@ app.get('/admin', async (req, res) => {
 
   <div class="log-panel">
     <div class="log-header">
-      <h2>Call Log (last ${MAX_LOG_ENTRIES})</h2>
+      <h2>Call Log <span style="font-size:13px;color:#888;font-weight:normal">(showing last ${MAX_LOG_ENTRIES} of ${totalLogCount} total — search queries all)</span></h2>
     </div>
     <div class="filter-bar">
       <input type="text" id="logSearch" placeholder="Search by phone, agent, ID..." oninput="filterLog()">
@@ -926,9 +1100,19 @@ app.get('/admin', async (req, res) => {
         // Update cache table
         const newTop = doc.querySelector('.top-section');
         if (newTop) document.querySelector('.top-section').innerHTML = newTop.innerHTML;
-        // Update log table body only
+        // Update log header (total count may have changed)
+        const newLogHeader = doc.querySelector('.log-header');
+        if (newLogHeader) document.querySelector('.log-header').innerHTML = newLogHeader.innerHTML;
+        // Update log table body and refresh originalLogHTML
         const newLogBody = doc.querySelector('#logTable');
-        if (newLogBody) document.getElementById('logTable').innerHTML = newLogBody.innerHTML;
+        if (newLogBody) {
+          originalLogHTML = newLogBody.innerHTML;
+          // Only overwrite visible table if user is NOT actively searching
+          const q = document.getElementById('logSearch').value.trim();
+          if (!q) {
+            document.getElementById('logTable').innerHTML = newLogBody.innerHTML;
+          }
+        }
         filterLog();
       } catch(e) {}
     }
@@ -981,18 +1165,62 @@ app.get('/admin', async (req, res) => {
       if (!e.target.closest('.type-filter')) dd.classList.remove('show');
     });
 
+    // Store original (last 500) rows so we can restore them when search is cleared
+    let originalLogHTML = document.getElementById('logTable').innerHTML;
+    let searchDebounceTimer = null;
+
     function filterLog() {
-      const q = document.getElementById('logSearch').value.toLowerCase();
+      const q = document.getElementById('logSearch').value.trim();
       const selected = getSelectedTypes();
-      const rows = document.querySelectorAll('#logTable tr[data-search]');
-      rows.forEach(row => {
-        const text = (row.getAttribute('data-search') || '').toLowerCase();
-        const type = row.getAttribute('data-type') || '';
-        const matchText = !q || text.includes(q);
-        const matchType = selected.includes(type);
-        row.style.display = (matchText && matchType) ? '' : 'none';
-      });
+
+      // If there's a search query, debounce and call server-side search API
+      if (q) {
+        clearTimeout(searchDebounceTimer);
+        searchDebounceTimer = setTimeout(() => serverSearch(q, selected), 300);
+      } else {
+        // No search query — restore original rows and filter by type client-side
+        clearTimeout(searchDebounceTimer);
+        document.getElementById('logTable').innerHTML = originalLogHTML;
+        const rows = document.querySelectorAll('#logTable tr[data-search]');
+        rows.forEach(row => {
+          const type = row.getAttribute('data-type') || '';
+          row.style.display = selected.includes(type) ? '' : 'none';
+        });
+      }
       saveState();
+    }
+
+    async function serverSearch(q, selectedTypes) {
+      try {
+        const params = new URLSearchParams({ q, types: selectedTypes.join(',') });
+        const resp = await fetch('/api/logs/search?' + params.toString());
+        const results = await resp.json();
+        const tbody = document.getElementById('logTable');
+        if (results.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="5" style="color:#888">No matching log entries</td></tr>';
+          return;
+        }
+        let html = '';
+        for (const log of results) {
+          const badgeClass = log.type === 'Answer' ? 'answer' : log.type === 'Transfer' ? 'transfer' : 'norecord';
+          const agent = log.dialpadAgent || log.five9Agent || '\u2014';
+          const sfLink = log.contactId
+            ? '<a href="' + log.contactUrl + '" target="_blank">' + log.contactId + '</a>'
+            : log.salesforceId
+              ? '<a href="' + log.sfRecordUrl + '" target="_blank">' + log.salesforceId + '</a>'
+              : '\u2014';
+          html += '<tr data-type="' + (log.type || '') + '" data-search="' + ((log.phone || '') + ' ' + (log.type || '') + ' ' + agent + ' ' + (log.salesforceId || '') + ' ' + (log.contactId || '')) + '">';
+          html += '<td><span class="log-badge ' + badgeClass + '">' + log.type + '</span></td>';
+          html += '<td>' + (log.phone || '\u2014') + '</td>';
+          html += '<td>' + sfLink + '</td>';
+          html += '<td>' + agent + '</td>';
+          html += '<td>' + log.displayTime + '</td>';
+          html += '</tr>';
+        }
+        tbody.innerHTML = html;
+      } catch(e) {
+        console.error('Search failed:', e);
+      }
     }
 
     // Restore saved state on load
@@ -1025,4 +1253,8 @@ app.listen(CONFIG.port, () => {
   } else {
     console.warn('[Startup] Salesforce credentials not configured - Lead conversion disabled');
   }
+
+  // Trim old log entries on startup, then every hour
+  trimOldLogs();
+  setInterval(trimOldLogs, 60 * 60 * 1000);
 });
