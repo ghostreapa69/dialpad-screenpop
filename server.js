@@ -212,6 +212,7 @@ const LEAD_TO_CONTACT_MAP = {
   'Property_Use__c': 'Property_Use__c',
   'Dialer_Lead_Generator_Notes__c': 'Lead_Generator_Notes__c',
   'Lead_Type__c': 'Lead_Type__c',
+  'lead_notes__c': 'lead_notes__c',
 };
 
 // Fields where we hardcode a value instead of copying from the Lead
@@ -265,10 +266,15 @@ async function getSfAccessToken() {
 // ============================================================
 
 // Look up a Salesforce User ID by email
+// Handles emails with apostrophes by trying:
+// 1. Escaped version for SOQL safety
+// 2. Version with apostrophe removed (common SF normalization)
 async function sfLookupUserByEmail(email) {
   const { accessToken, instanceUrl } = await getSfAccessToken();
 
-  const query = `SELECT Id, Name FROM User WHERE Email = '${email}' AND IsActive = true LIMIT 1`;
+  // Escape single quotes for SOQL safety
+  const escapedEmail = email.replace(/'/g, "\\'");
+  const query = `SELECT Id, Name FROM User WHERE Email = '${escapedEmail}' AND IsActive = true LIMIT 1`;
 
   try {
     const response = await axios.get(`${instanceUrl}/services/data/v59.0/query`, {
@@ -280,6 +286,24 @@ async function sfLookupUserByEmail(email) {
       const user = response.data.records[0];
       console.log(`[SF] Found user: ${user.Name} (${user.Id}) for email ${email}`);
       return user.Id;
+    }
+
+    // If email contains apostrophe, try without it (common mismatch between Dialpad and SF)
+    if (email.includes("'")) {
+      const normalizedEmail = email.replace(/'/g, '');
+      console.log(`[SF] No user found for "${email}", trying normalized: "${normalizedEmail}"`);
+      
+      const normalizedQuery = `SELECT Id, Name FROM User WHERE Email = '${normalizedEmail}' AND IsActive = true LIMIT 1`;
+      const normalizedResponse = await axios.get(`${instanceUrl}/services/data/v59.0/query`, {
+        params: { q: normalizedQuery },
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+
+      if (normalizedResponse.data.totalSize > 0) {
+        const user = normalizedResponse.data.records[0];
+        console.log(`[SF] Found user with normalized email: ${user.Name} (${user.Id}) for ${normalizedEmail}`);
+        return user.Id;
+      }
     }
 
     console.warn(`[SF] No active Salesforce user found for email: ${email}`);
