@@ -345,7 +345,7 @@ async function sfGetLead(leadId) {
 }
 
 // Create a Contact from Lead data with agent as owner
-async function sfCreateContact(leadData, ownerId, five9AgentName, leadId) {
+async function sfCreateContact(leadData, ownerId, five9AgentName, leadId, fallbackPhone) {
   const { accessToken, instanceUrl } = await getSfAccessToken();
 
   const contactRecord = {};
@@ -383,6 +383,11 @@ async function sfCreateContact(leadData, ownerId, five9AgentName, leadId) {
     contactRecord['Telemarketer__c'] = five9AgentName;
   }
 
+  // If Best Contact Number is blank on the Lead, fall back to the caller's phone
+  if (!contactRecord['Best_Contact_Number__c'] && fallbackPhone) {
+    contactRecord['Best_Contact_Number__c'] = formatPhoneForSalesforce(fallbackPhone);
+  }
+
   console.log(`[SF] Creating Contact with ${Object.keys(contactRecord).length} fields, owner: ${ownerId}`);
   console.log(`[SF] Contact preview: ${contactRecord.FirstName__c || ''} ${contactRecord.LastName__c || ''}, phone: ${contactRecord.Phone_1__c || 'N/A'}`);
 
@@ -407,7 +412,7 @@ async function sfCreateContact(leadData, ownerId, five9AgentName, leadId) {
 }
 
 // Full workflow: Lead -> Contact with agent as owner
-async function convertLeadToContact(leadId, agentEmail, five9AgentName) {
+async function convertLeadToContact(leadId, agentEmail, five9AgentName, callerPhone) {
   console.log(`[Convert] Starting: Lead ${leadId}, agent ${agentEmail}, five9Agent: ${five9AgentName || 'N/A'}`);
 
   // Step 1: Look up SF User by Dialpad agent's email
@@ -425,7 +430,7 @@ async function convertLeadToContact(leadId, agentEmail, five9AgentName) {
   }
 
   // Step 3: Create the Contact
-  const contactId = await sfCreateContact(leadData, ownerId, five9AgentName, leadId);
+  const contactId = await sfCreateContact(leadData, ownerId, five9AgentName, leadId, callerPhone);
   if (!contactId) {
     console.error('[Convert] Contact creation failed');
     return null;
@@ -486,6 +491,21 @@ function normalizePhone(phone) {
     cleaned = '+' + cleaned;
   }
   return cleaned;
+}
+
+function formatPhoneForSalesforce(phone) {
+  if (!phone) return null;
+
+  const digits = String(phone).replace(/\D/g, '');
+  const localNumber = digits.length === 11 && digits.startsWith('1')
+    ? digits.slice(1)
+    : digits;
+
+  if (localNumber.length !== 10) {
+    return phone;
+  }
+
+  return `(${localNumber.slice(0, 3)}) ${localNumber.slice(3, 6)}-${localNumber.slice(6)}`;
 }
 
 // ============================================================
@@ -762,7 +782,7 @@ app.post('/dialpad/call-events', async (req, res) => {
     console.log(`[Dialpad] Transfers Group check disabled - proceeding with contact creation for ${agentEmail}`);
   }
 
-  const contactId = await convertLeadToContact(cached.salesforceId, agentEmail, cached.agentName);
+  const contactId = await convertLeadToContact(cached.salesforceId, agentEmail, cached.agentName, callerPhone);
 
   if (contactId) {
     const contactUrl = sfRecordUrl(contactId);
